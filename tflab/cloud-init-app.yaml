@@ -1,0 +1,171 @@
+#cloud-config
+package_update: true
+packages:
+  - openjdk-17-jre-headless
+  - curl
+  - htop
+  - sysstat
+  - jq
+
+# Create payment service user
+users:
+  - name: payment
+    system: true
+    shell: /usr/sbin/nologin
+
+# Create application directories
+runcmd:
+  - mkdir -p /opt/payment-service/logs
+  - mkdir -p /var/log/payment-service
+  - chown -R payment:payment /opt/payment-service
+  - chown -R payment:payment /var/log/payment-service
+  
+# Configure logrotate for payment service logs
+write_files:
+  - path: /etc/logrotate.d/payment-service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      /var/log/payment-service/*.log
+      /opt/payment-service/logs/*.log
+      {
+          daily
+          rotate 7
+          compress
+          delaycompress
+          missingok
+          notifempty
+          create 0640 payment payment
+          sharedscripts
+          postrotate
+              systemctl reload payment-service > /dev/null 2>&1 || true
+          endscript
+      }
+  
+  - path: /etc/logrotate.d/syslog
+    owner: root:root
+    permissions: '0644'
+    content: |
+      /var/log/syslog
+      /var/log/messages
+      {
+          daily
+          rotate 7
+          compress
+          delaycompress
+          missingok
+          notifempty
+          create 0640 root root
+          sharedscripts
+          postrotate
+              systemctl reload rsyslog > /dev/null 2>&1 || true
+          endscript
+      }
+  
+  # Disk trend capture script (runs weekly, populates trend data)
+  - path: /usr/local/bin/disk-trend-capture.sh
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      
+      # Disk and resource trend capture for capacity planning
+      # Runs weekly to populate historical trend data
+      
+      TREND_LOG="/var/log/capacity-trends.csv"
+      TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+      EPOCH_DAY=$(date +%s | awk '{print int($1 / 86400)}')
+      
+      # Initialize CSV header if file doesn't exist
+      if [ ! -f "$TREND_LOG" ]; then
+        echo "epoch_day,timestamp,cpu_pct,mem_pct,disk_pct,db_connections" > "$TREND_LOG"
+      fi
+      
+      # CPU usage (average over last 5 minutes from /proc/loadavg)
+      CPU_PCT=$(awk '{printf "%.1f", $1 * 100 / 4}' /proc/loadavg)
+      
+      # Memory usage
+      MEM_DATA=$(free | grep Mem)
+      MEM_USED=$(echo "$MEM_DATA" | awk '{print $3}')
+      MEM_TOTAL=$(echo "$MEM_DATA" | awk '{print $2}')
+      MEM_PCT=$(echo "scale=1; $MEM_USED * 100 / $MEM_TOTAL" | bc)
+      
+      # Disk usage on root partition
+      DISK_PCT=$(df / | tail -1 | awk '{print $5}' | sed 's/%//')
+      
+      # DB connections (if PostgreSQL is accessible)
+      DB_CONNECTIONS=0
+      if command -v psql &> /dev/null; then
+        DB_CONNECTIONS=$(psql -h 10.0.2.10 -U labuser -d labdb -t -c "SELECT count(*) FROM pg_stat_activity;" 2>/dev/null || echo "0")
+      fi
+      
+      # Append trend data
+      echo "$EPOCH_DAY,$TIMESTAMP,$CPU_PCT,$MEM_PCT,$DISK_PCT,$DB_CONNECTIONS" >> "$TREND_LOG"
+      
+      echo "[$(date)] Capacity trend captured: CPU=$CPU_PCT% MEM=$MEM_PCT% DISK=$DISK_PCT% DB_CONN=$DB_CONNECTIONS"
+  
+  # Disk breakdown diagnostic script (on-demand troubleshooting)
+  - path: /usr/local/bin/disk-breakdown.sh
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      
+      # On-demand disk usage breakdown for troubleshooting
+      
+      echo "=== ROOT FILESYSTEM BREAKDOWN ==="
+      du -sh /* 2>/dev/null | sort -hr
+      
+      echo -e "\n=== /var BREAKDOWN ==="
+      du -sh /var/* 2>/dev/null | sort -hr
+      
+      echo -e "\n=== /opt BREAKDOWN ==="
+      du -sh /opt/* 2>/dev/null | sort -hr
+      
+      echo -e "\n=== /tmp BREAKDOWN ==="
+      du -sh /tmp/* 2>/dev/null | sort -hr | head -10
+      
+      echo -e "\n=== LARGEST DIRECTORIES (top 20) ==="
+      find / -type d -name logs 2>/dev/null | xargs du -sh 2>/dev/null | sort -hr | head -20
+      
+      echo -e "\n=== RECENT FILES (modified in last 7 days) ==="
+      find /var/log -type f -mtime -7 -exec du -h {} + 2>/dev/null | sort -hr | head -10
+      
+      echo -e "\n=== DISK USAGE SUMMARY ==="
+      df -h / | grep -v "Filesystem"
+  
+  # JVM heap trend capture (if Java payment service is running)
+  - path: /usr/local/bin/jvm-heap-capture.sh
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      
+      # Capture JVM heap and GC statistics for memory leak detection
+      # Usage: runs via cron, samples every 60 seconds for 7 days
+      
+      LOG_DIR="/var/log/payment"
+      mkdir -p "$LOG_DIR"
+      LOG_FILE="$LOG_DIR/jvm_heap_gcutil_$(date +%F).log"
+      
+      # Find Java payment service PID
+      PID=$(pgrep -f "java.*payment-service" 2>/dev/null)
+      
+      if [ -z "$PID" ]; then
+        echo "[$(date)] Payment service not running, skipping JVM capture"
+        exit 0
+      fi
+      
+      echo "[$(date)] Starting JVM heap capture for PID $PID to $LOG_FILE"
+      
+      # Capture jstat output: 10080 samples at 60s interval = 7 days
+      # -t includes JVM uptime, -gcutil shows garbage collection stats
+      jstat -gcutil -t "$PID" 60000 10080 >> "$LOG_FILE" 2>&1 &
+      
+      echo "[$(date)] JVM capture process started (PID: $!)"
+
+# Schedule trend capture (weekly on Sunday at 09:00)
+bootcmd:
+  - echo "0 9 * * 0 /usr/local/bin/disk-trend-capture.sh" | crontab -
+
+final_message: "Payment service VM initialized with logrotate and capacity monitoring"

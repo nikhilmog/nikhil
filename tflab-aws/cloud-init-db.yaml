@@ -1,0 +1,27 @@
+#cloud-config
+# DB VM bootstrap — creates labadmin user and installs/configures PostgreSQL 14
+# Equivalent to Azure vm-db cloud-init. Private IP 10.0.2.10 is preserved.
+
+users:
+  - name: labadmin
+    groups: sudo
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+package_update: true
+packages:
+  - postgresql-14
+  - postgresql-client-14
+
+runcmd:
+  - systemctl enable postgresql
+  - systemctl start postgresql
+  - sudo -u postgres psql -c "CREATE USER labuser WITH PASSWORD '${db_password}';"
+  - sudo -u postgres psql -c "CREATE DATABASE labdb OWNER labuser;"
+  - sudo -u postgres psql -c "ALTER SYSTEM SET listen_addresses = '10.0.2.10';"
+  - sudo -u postgres psql -c "ALTER SYSTEM SET max_connections = '20';"
+  - echo 'host labdb labuser 10.0.1.0/24 md5' >> /etc/postgresql/14/main/pg_hba.conf
+  - systemctl restart postgresql

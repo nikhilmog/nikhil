@@ -1,0 +1,11 @@
+Monitoring Alert / User Issue
+        ↓
+L1 Support (Basic checks)
+        ↓
+L2 DBA (Analysis & tuning)
+        ↓
+L3 SME (Deep technical fix)
+        ↓
+Vendor Support (if required)
+        ↓
+Resolution → RCA → Prevention

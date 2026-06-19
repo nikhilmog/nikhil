@@ -1,0 +1,15 @@
+#cloud-config
+# App VM bootstrap — creates labadmin user with SSH key
+# Equivalent to Azure vm-app (no additional packages)
+
+users:
+  - name: labadmin
+    groups: sudo
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+package_update: true
+package_upgrade: false

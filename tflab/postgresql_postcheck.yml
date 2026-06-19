@@ -1,0 +1,652 @@
+---
+dba_readiness_checklist:
+  metadata:
+    name: PostgreSQL 14 Post-Deployment Readiness Checklist
+    role: Database Administrator
+    environment: rg-ailab-nikhil
+    region: eastus
+    created: "2026-06-16"
+    target_vm: vm-db
+    target_db_ip: "10.0.2.10"
+    target_db_port: 5432
+    postgres_version: "14"
+    app_vm_ip: "10.0.1.10"
+    bastion_subnet: "10.0.3.0/27"
+    sign_off_rule: >
+      All SECURITY and CONNECTIVITY checks must PASS before the environment
+      is declared ready for lab use. MONITORING and PERFORMANCE failures are
+      operational warnings. BACKUP items are accepted-risk documentation.
+
+  checks:
+
+    # =========================================================================
+    # SECURITY — checks 1–7
+    # =========================================================================
+
+    - id: SEC-01
+      category: SECURITY
+      check: >
+        PostgreSQL is NOT listening on 0.0.0.0 — only on the private NIC IP
+        as configured by cloud-init ALTER SYSTEM SET listen_addresses.
+      shell: bash
+      target: vm-db
+      commands:
+        - sudo -u postgres psql -c "SHOW listen_addresses;"
+        - "ss -tlnp | grep 5432"
+      expected: >
+        listen_addresses = '10.0.2.10'.
+        ss shows 10.0.2.10:5432 only — NOT 0.0.0.0:5432 or :::5432.
+      dba_tower_note: >
+        A default PostgreSQL install binds to localhost. cloud-init sets
+        listen_addresses to the static private IP via ALTER SYSTEM + restart.
+        If cloud-init failed silently, the DB is unreachable from vm-app and
+        the entire application data path is broken. If it bound to 0.0.0.0,
+        it accepts connections from any subnet — a security violation given
+        only snet-app should have access.
+
+    - id: SEC-02
+      category: SECURITY
+      check: >
+        pg_hba.conf restricts labdb access to the app subnet (10.0.1.0/24)
+        using md5 password auth — no 'trust' entries for any network source.
+      shell: bash
+      target: vm-db
+      commands:
+        - "sudo grep -v '^#\\|^$' /etc/postgresql/14/main/pg_hba.conf"
+      expected: >
+        Line present: host labdb labuser 10.0.1.0/24 md5
+        Zero lines containing 'trust' for host-type entries.
+        local entries may use trust/peer — acceptable for Unix socket superuser.
+      dba_tower_note: >
+        'trust' for a network range means zero-password authentication —
+        any process on the app subnet can connect as labuser without credentials.
+        cloud-init appends the md5 line; verify it was written and no prior
+        permissive rule overrides it (pg_hba.conf is evaluated top-to-bottom,
+        first match wins).
+
+    - id: SEC-03
+      category: SECURITY
+      check: >
+        labuser role exists, owns labdb, and has only the minimum required
+        privileges — no SUPERUSER, CREATEDB, or CREATEROLE attributes.
+      shell: bash
+      target: vm-db
+      commands:
+        - >
+          sudo -u postgres psql -c "
+          SELECT rolname, rolsuper, rolcreatedb, rolcreaterole, rolcanlogin
+          FROM pg_roles
+          WHERE rolname = 'labuser';"
+        - >
+          sudo -u postgres psql -c "
+          SELECT datname, pg_catalog.pg_get_userbyid(datdba) AS owner
+          FROM pg_database
+          WHERE datname = 'labdb';"
+      expected: >
+        rolsuper=false, rolcreatedb=false, rolcreaterole=false, rolcanlogin=true.
+        labdb datdba = labuser.
+      dba_tower_note: >
+        Principle of least privilege for the application DB user. A labuser
+        with SUPERUSER can bypass row-level security, read pg_shadow (password
+        hashes), and modify system catalogs. This is the account whose
+        credentials are embedded in cloud-init and potentially visible in
+        boot diagnostics logs.
+
+    - id: SEC-04
+      category: SECURITY
+      check: >
+        The labuser password meets minimum complexity and is not the default
+        cloud-init value in a production promotion scenario. Verify the role
+        has a password hash set (not no-password).
+      shell: bash
+      target: vm-db
+      commands:
+        - >
+          sudo -u postgres psql -c "
+          SELECT rolname,
+                 CASE WHEN rolpassword IS NULL THEN 'NO PASSWORD SET'
+                      WHEN rolpassword = '' THEN 'EMPTY PASSWORD'
+                      ELSE 'PASSWORD HASH PRESENT'
+                 END AS password_status
+          FROM pg_authid
+          WHERE rolname = 'labuser';"
+      expected: >
+        password_status = 'PASSWORD HASH PRESENT' (md5... or SCRAM-SHA-256 prefix).
+        Flag if value is 'NO PASSWORD SET' — labuser would have no auth requirement.
+      dba_tower_note: >
+        cloud-init sets password 'Lab@2024!' via CREATE USER. Confirm the hash
+        is present in pg_authid. For production promotion, this password must
+        be rotated and stored in Azure Key Vault — not in a cloud-init YAML
+        that appears in boot diagnostics logs.
+
+    - id: SEC-05
+      category: SECURITY
+      check: >
+        PostgreSQL SSL is configured — confirm ssl = on and a certificate
+        exists. Even in a lab, validating SSL posture establishes the baseline
+        for production promotion.
+      shell: bash
+      target: vm-db
+      commands:
+        - "sudo -u postgres psql -c \"SHOW ssl;\""
+        - "sudo ls -la /etc/postgresql/14/main/server.crt /etc/postgresql/14/main/server.key"
+      expected: >
+        ssl = on (PostgreSQL 14 default).
+        server.crt and server.key present, server.key permissions 0600 owned by postgres.
+        Note: cloud-init does not generate a CA-signed cert — self-signed is acceptable for lab.
+      dba_tower_note: >
+        SSL off means all credentials transmitted from vm-app to vm-db cross
+        the VNet in plaintext. Azure VNet traffic is not encrypted at layer 3
+        by default. For a lab this is low risk; for production it is a
+        compliance failure under PCI-DSS and SOC 2.
+
+    - id: SEC-06
+      category: SECURITY
+      check: >
+        PostgreSQL log_connections and log_disconnections are enabled —
+        all connection events written to the PostgreSQL log file.
+      shell: bash
+      target: vm-db
+      commands:
+        - >
+          sudo -u postgres psql -c "
+          SELECT name, setting FROM pg_settings
+          WHERE name IN ('log_connections','log_disconnections','log_line_prefix','logging_collector');"
+      expected: >
+        log_connections = on, log_disconnections = on, logging_collector = on.
+        log_line_prefix includes %t (timestamp) and %u (username) at minimum.
+      dba_tower_note: >
+        Connection logging is the DBA's audit trail. Without it, there is no
+        record of which application connected, when, and from which IP —
+        critical for incident response when the payment service is involved.
+        cloud-init does not enable these; they must be set via ALTER SYSTEM.
+
+    - id: SEC-07
+      category: SECURITY
+      check: >
+        PostgreSQL data directory permissions are locked down — only postgres
+        OS user can read/write the data directory.
+      shell: bash
+      target: vm-db
+      commands:
+        - "sudo -u postgres psql -c \"SHOW data_directory;\""
+        - "sudo stat -c '%a %U %G' /var/lib/postgresql/14/main"
+        - "sudo ls -la /var/lib/postgresql/14/"
+      expected: >
+        data_directory = /var/lib/postgresql/14/main.
+        Permissions: 700, owner: postgres, group: postgres.
+        No world-readable or group-writable bits.
+      dba_tower_note: >
+        A world-readable data directory allows any OS user (e.g., labadmin
+        added by Terraform) to read raw PostgreSQL heap files — bypassing
+        all database-level access controls. This is a file-system-level data
+        exfiltration vector.
+
+    # =========================================================================
+    # CONNECTIVITY — checks 8–11
+    # =========================================================================
+
+    - id: CON-01
+      category: CONNECTIVITY
+      check: >
+        PostgreSQL accepts authenticated connections from vm-app (10.0.1.10)
+        as labuser to labdb — full end-to-end connectivity stack validated.
+      shell: bash
+      target: vm-app
+      commands:
+        - >
+          PGPASSWORD='Lab@2024!' psql -h 10.0.2.10 -U labuser -d labdb
+            -c "SELECT version(), current_database(), current_user, inet_server_addr(), inet_server_port();"
+      expected: >
+        Row returned showing:
+          version: PostgreSQL 14.x
+          current_database: labdb
+          current_user: labuser
+          inet_server_addr: 10.0.2.10
+          inet_server_port: 5432
+        No FATAL, connection refused, or authentication failed errors.
+      dba_tower_note: >
+        This single query validates all four layers simultaneously: NSG rule
+        (network), listen_addresses (socket binding), pg_hba.conf (client auth),
+        and role/database existence (catalog). It is the first command every DBA
+        should run and the last they verify after any configuration change.
+
+    - id: CON-02
+      category: CONNECTIVITY
+      check: >
+        PostgreSQL rejects a connection from vm-db itself using an IP outside
+        pg_hba.conf scope — confirms the host-based auth boundary is enforced.
+      shell: bash
+      target: vm-db
+      commands:
+        - >
+          PGPASSWORD='Lab@2024!' psql -h 10.0.2.10 -U labuser -d labdb
+            -c "SELECT 'should be rejected';" 2>&1 | head -3
+      expected: >
+        FATAL: no pg_hba.conf entry for host "10.0.2.10", user "labuser", database "labdb"
+        OR connection refused (if listen_addresses excludes 10.0.2.10 loopback path).
+        A successful connection here indicates pg_hba.conf is too permissive.
+      dba_tower_note: >
+        The DB VM itself should not be in the allowed client range. Successful
+        auth from 10.0.2.10 means pg_hba.conf has a wildcard 0.0.0.0/0 or
+        broader subnet rule that violates least-privilege network access.
+
+    - id: CON-03
+      category: CONNECTIVITY
+      check: >
+        Port 5432 is unreachable from vm-win (Windows VM on snet-app) at the
+        TCP level OR is reachable but authentication is rejected — document
+        the actual boundary enforced.
+      shell: powershell
+      target: vm-win
+      commands:
+        - "Test-NetConnection -ComputerName 10.0.2.10 -Port 5432 | Select-Object ComputerName, RemotePort, TcpTestSucceeded"
+      expected: >
+        If NSG restricts by IP: TcpTestSucceeded = False.
+        If NSG allows 10.0.1.0/24 (entire subnet): TcpTestSucceeded = True — but
+        pg_hba.conf must still reject labuser auth from 10.0.1.20 (no client tool installed).
+        Document the actual result as the enforced boundary for this environment.
+      dba_tower_note: >
+        The current NSG allows all of 10.0.1.0/24 → 5432 which includes vm-win
+        at 10.0.1.20. The only protection is pg_hba.conf and the absence of a
+        PostgreSQL client on Windows. For stricter environments, the NSG source
+        should be scoped to 10.0.1.10/32 (vm-app static IP only).
+
+    - id: CON-04
+      category: CONNECTIVITY
+      check: >
+        PostgreSQL max_connections setting matches the cloud-init configured
+        value (20) and current active connections are within safe operating range.
+      shell: bash
+      target: vm-db
+      commands:
+        - >
+          sudo -u postgres psql -c "
+          SELECT
+            (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') AS max_connections,
+            count(*) AS active_connections,
+            count(*) FILTER (WHERE state = 'active') AS executing,
+            count(*) FILTER (WHERE state = 'idle') AS idle,
+            count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_tx
+          FROM pg_stat_activity
+          WHERE pid <> pg_backend_pid();"
+      expected: >
+        max_connections = 20.
+        active_connections < 5 immediately post-deployment (only system background workers).
+        idle_in_tx = 0 (no hung transactions from cloud-init run).
+      dba_tower_note: >
+        Peak connections reach 19/20 during lab exercises. Starting above 5 active
+        connections immediately post-deployment indicates a cloud-init psql command
+        left an open transaction (idle in transaction) — these hold locks and consume
+        a connection slot indefinitely until the session is terminated.
+
+    # =========================================================================
+    # MONITORING — checks 12–14
+    # =========================================================================
+
+    - id: MON-01
+      category: MONITORING
+      check: >
+        PostgreSQL server log is being written to disk and shows a clean startup
+        with no FATAL, PANIC, or ERROR lines after the most recent restart.
+      shell: bash
+      target: vm-db
+      commands:
+        - "sudo tail -60 /var/log/postgresql/postgresql-14-main.log"
+        - "sudo grep -c 'FATAL\\|PANIC' /var/log/postgresql/postgresql-14-main.log || echo '0 critical errors'"
+      expected: >
+        Final lines include: 'database system is ready to accept connections'.
+        Zero FATAL or PANIC entries after the last startup timestamp.
+        ERROR entries from cloud-init psql commands are acceptable if they relate
+        to 'role already exists' type messages — flag anything else.
+      dba_tower_note: >
+        The cloud-init sequence runs ALTER SYSTEM + systemctl restart. If the
+        restart failed (e.g., bind failure on listen_addresses before NIC was
+        fully up), PostgreSQL is installed but not running — and the log is the
+        only evidence of why. This is the first file to check on any DB issue.
+
+    - id: MON-02
+      category: MONITORING
+      check: >
+        postgresql.auto.conf contains the ALTER SYSTEM overrides applied by
+        cloud-init — shared_buffers, listen_addresses, max_connections are all
+        present and match expected values.
+      shell: bash
+      target: vm-db
+      commands:
+        - "sudo cat /etc/postgresql/14/main/postgresql.auto.conf"
+        - >
+          sudo -u postgres psql -c "
+          SELECT name, setting, source
+          FROM pg_settings
+          WHERE name IN ('listen_addresses','max_connections','shared_buffers','work_mem','effective_cache_size')
+          ORDER BY name;"
+      expected: >
+        postgresql.auto.conf contains listen_addresses and max_connections entries.
+        pg_settings source = 'configuration file' for these parameters.
+        If source = 'default' for listen_addresses or max_connections, the ALTER SYSTEM
+        commands ran but the subsequent restart did not load them — FAIL.
+      dba_tower_note: >
+        ALTER SYSTEM writes to postgresql.auto.conf but changes are only active
+        after pg_reload_conf() or a restart. The pg_settings 'source' column is
+        the definitive proof that the running PostgreSQL process loaded the value
+        from file — not falling back to compiled-in defaults.
+
+    - id: MON-03
+      category: MONITORING
+      check: >
+        pg_stat_bgwriter shows no checkpointing warnings — checkpoint_warning
+        threshold not being breached and buffers_clean > 0 (background writer active).
+      shell: bash
+      target: vm-db
+      commands:
+        - >
+          sudo -u postgres psql -c "
+          SELECT checkpoints_timed, checkpoints_req,
+                 buffers_checkpoint, buffers_clean, buffers_backend,
+                 maxwritten_clean, checkpoint_write_time, checkpoint_sync_time,
+                 stats_reset
+          FROM pg_stat_bgwriter;"
+      expected: >
+        checkpoints_req should be 0 or very low post-deployment (no write pressure yet).
+        buffers_backend = 0 ideal (means backend processes not forced to write dirty buffers).
+        stats_reset timestamp is recent (after the last PostgreSQL restart).
+      dba_tower_note: >
+        High checkpoints_req relative to checkpoints_timed indicates write-ahead
+        log pressure — common on Standard_LRS 30 GB disks with 500 IOPS ceiling.
+        buffers_backend > 0 on a fresh deployment is a red flag that shared_buffers
+        is too small and PostgreSQL cannot keep up using background writers alone.
+
+    # =========================================================================
+    # BACKUP — checks 15–16
+    # =========================================================================
+
+    - id: BAK-01
+      category: BACKUP
+      check: >
+        PostgreSQL WAL archiving status and current WAL file — confirm
+        wal_level and archive_mode settings for recovery point awareness.
+      shell: bash
+      target: vm-db
+      commands:
+        - >
+          sudo -u postgres psql -c "
+          SELECT name, setting
+          FROM pg_settings
+          WHERE name IN ('wal_level','archive_mode','archive_command','max_wal_size','wal_keep_size');"
+        - "sudo -u postgres psql -c \"SELECT pg_current_wal_lsn(), pg_walfile_name(pg_current_wal_lsn());\""
+      expected: >
+        wal_level = replica or logical (not minimal — minimal prevents replication).
+        archive_mode = off (acceptable for lab; must be 'on' for production PITR).
+        Current WAL LSN and filename returned — confirms WAL subsystem is functional.
+        Document archive_mode = off as an accepted risk for this lab environment.
+      dba_tower_note: >
+        With archive_mode = off, there is no point-in-time recovery capability.
+        Any transaction committed between VM snapshots is unrecoverable on disk
+        failure. For the lab this is an accepted risk. For production promotion,
+        archive_mode = on with an Azure Blob Storage archive_command is mandatory.
+
+    - id: BAK-02
+      category: BACKUP
+      check: >
+        A logical backup of labdb can be successfully created using pg_dump —
+        validates that the backup toolchain works and the database schema
+        is consistent post cloud-init.
+      shell: bash
+      target: vm-db
+      commands:
+        - >
+          sudo -u postgres pg_dump -Fc -f /tmp/labdb_postdeploy_$(date +%Y%m%d).dump labdb &&
+          ls -lh /tmp/labdb_postdeploy_*.dump
+        - >
+          sudo -u postgres pg_restore --list /tmp/labdb_postdeploy_$(date +%Y%m%d).dump |
+          head -20
+      expected: >
+        pg_dump exits with code 0, no errors.
+        Dump file created in /tmp/ with non-zero size (even empty schema > 1 KB).
+        pg_restore --list shows database header and schema entries.
+        Clean up: sudo rm /tmp/labdb_postdeploy_*.dump after validation.
+      dba_tower_note: >
+        A successful pg_dump proves: the postgres superuser has read access to all
+        objects, the database is internally consistent (no catalog corruption from
+        cloud-init), and the backup tool chain is functional. A zero-byte or erroring
+        dump at deployment baseline means backups have been silently failing since day 1.
+
+    # =========================================================================
+    # PERFORMANCE — checks 17–20
+    # =========================================================================
+
+    - id: PERF-01
+      category: PERFORMANCE
+      check: >
+        Confirm shared_buffers, work_mem, and effective_cache_size reflect the
+        tuned values for 8 GB RAM — NOT PostgreSQL compiled-in defaults.
+      shell: bash
+      target: vm-db
+      commands:
+        - >
+          sudo -u postgres psql -c "
+          SELECT name,
+                 setting,
+                 unit,
+                 CASE unit
+                   WHEN '8kB' THEN (setting::bigint * 8192 / 1048576)::text || ' MB'
+                   WHEN 'kB'  THEN (setting::bigint / 1024)::text || ' MB'
+                   ELSE setting
+                 END AS human_readable
+          FROM pg_settings
+          WHERE name IN ('shared_buffers','work_mem','effective_cache_size',
+                         'wal_buffers','checkpoint_completion_target','random_page_cost')
+          ORDER BY name;"
+      expected: >
+        shared_buffers     : 2048 MB  (2GB  — 25% of 8GB RAM)
+        effective_cache_size: 6144 MB (6GB  — 75% of 8GB RAM)
+        work_mem           :  153 MB  (formula: (8192-2048) / (20*2))
+        wal_buffers        :   64 MB
+        checkpoint_completion_target: 0.9
+        random_page_cost   :  1.1     (SSD-equivalent for Azure managed disk)
+        FAIL if shared_buffers = 128MB (PostgreSQL default — tuning not applied).
+      dba_tower_note: >
+        Default shared_buffers of 128 MB on an 8 GB server means PostgreSQL uses
+        only 1.5% of available RAM as its buffer pool. Every data page read is a
+        disk I/O on the 500 IOPS Standard_LRS disk. With 20 connections and complex
+        queries, default work_mem (4 MB) means every sort and hash join spills to
+        disk. These are the highest-impact, zero-cost performance settings.
+
+    - id: PERF-02
+      category: PERFORMANCE
+      check: >
+        OS-level memory usage confirms PostgreSQL shared memory segment is
+        correctly sized — no OOM events since boot.
+      shell: bash
+      target: vm-db
+      commands:
+        - "free -h"
+        - "sudo grep -i 'out of memory\\|oom' /var/log/syslog | tail -5 || echo 'No OOM events in syslog'"
+        - "ipcs -m | grep postgres || echo 'Shared memory segment check'"
+      expected: >
+        free -h: used + shared < 6.5 GB (leaves 1.5 GB headroom for OS + connections).
+        Zero OOM entries in syslog.
+        If shared_buffers = 2GB is correctly set, the PostgreSQL shared memory
+        segment will be approximately 2.1 GB in ipcs output.
+      dba_tower_note: >
+        B2ms burstable VMs share physical memory with the hypervisor's credit
+        accounting. An OOM event immediately post-deployment (before any lab load)
+        means cloud-init ran apt upgrade + PostgreSQL initialization simultaneously
+        and exhausted RAM. Subsequent DB restarts will fail until the VM is rebooted.
+
+    - id: PERF-03
+      category: PERFORMANCE
+      check: >
+        Disk I/O latency is within acceptable bounds for Standard_LRS
+        (30 GB, 500 IOPS ceiling) — confirm PostgreSQL data directory is
+        on the OS disk and not competing with OS writes.
+      shell: bash
+      target: vm-db
+      commands:
+        - "df -h /var/lib/postgresql/"
+        - "iostat -xd sda 3 3 | awk 'NR>3'"
+        - >
+          sudo -u postgres psql -c "
+          SELECT pg_size_pretty(pg_database_size('labdb')) AS labdb_size,
+                 pg_size_pretty(pg_tablespace_size('pg_default')) AS default_tablespace_size;"
+      expected: >
+        /var/lib/postgresql/ mounted on /dev/sda (OS disk).
+        iostat: %util < 30% at idle, await < 10ms.
+        labdb_size: 7–10 MB for an empty post-deployment schema (normal).
+        WARN if %util > 80% — cloud-init apt upgrade may have exhausted disk credits.
+      dba_tower_note: >
+        Standard_LRS 30 GB has a 500 IOPS / 60 MB/s throughput ceiling with no
+        bursting. PostgreSQL data directory, WAL, and OS system logs all compete
+        for this budget. For the lab, this is acceptable at low concurrency. For
+        production, the data directory should be on a separate Premium_LRS P10+
+        data disk with dedicated IOPS.
+
+    - id: PERF-04
+      category: PERFORMANCE
+      check: >
+        PostgreSQL autovacuum is enabled and the autovacuum launcher process
+        is running — confirms routine maintenance will execute without DBA intervention.
+      shell: bash
+      target: vm-db
+      commands:
+        - "sudo -u postgres psql -c \"SHOW autovacuum;\""
+        - >
+          sudo -u postgres psql -c "
+          SELECT pid, usename, application_name, state, query
+          FROM pg_stat_activity
+          WHERE application_name ILIKE '%autovacuum%' OR query ILIKE '%autovacuum%';"
+        - "ps aux | grep autovacuum | grep -v grep"
+      expected: >
+        autovacuum = on.
+        autovacuum launcher process visible in ps output (postgres: autovacuum launcher).
+        pg_stat_activity may show 0 workers post-deployment (normal — no table bloat yet).
+      dba_tower_note: >
+        Autovacuum = off is a common lab misconfiguration or inherited from a template.
+        A freshly deployed database without autovacuum will accumulate dead tuples
+        from every UPDATE/DELETE in lab exercises. After sufficient use, table bloat
+        degrades query performance and eventually triggers transaction ID wraparound —
+        an emergency that requires exclusive DB lock to resolve.
+
+  sign_off_matrix:
+    description: >
+      Record pass/fail for each check. Environment is DBA-ready when all
+      SECURITY and CONNECTIVITY items pass. Raise a change request before
+      production promotion for any BACKUP or PERFORMANCE finding.
+    table:
+      - id: SEC-01
+        category: SECURITY
+        check: listen_addresses binding
+        status: "[ ]"
+        notes: ""
+      - id: SEC-02
+        category: SECURITY
+        check: pg_hba.conf md5 / no trust
+        status: "[ ]"
+        notes: ""
+      - id: SEC-03
+        category: SECURITY
+        check: labuser least privilege
+        status: "[ ]"
+        notes: ""
+      - id: SEC-04
+        category: SECURITY
+        check: labuser password hash present
+        status: "[ ]"
+        notes: ""
+      - id: SEC-05
+        category: SECURITY
+        check: SSL enabled / cert present
+        status: "[ ]"
+        notes: ""
+      - id: SEC-06
+        category: SECURITY
+        check: log_connections / log_disconnections on
+        status: "[ ]"
+        notes: ""
+      - id: SEC-07
+        category: SECURITY
+        check: data directory permissions 700/postgres
+        status: "[ ]"
+        notes: ""
+      - id: CON-01
+        category: CONNECTIVITY
+        check: End-to-end labuser auth from vm-app
+        status: "[ ]"
+        notes: ""
+      - id: CON-02
+        category: CONNECTIVITY
+        check: Rejected connection from vm-db self
+        status: "[ ]"
+        notes: ""
+      - id: CON-03
+        category: CONNECTIVITY
+        check: vm-win lateral access boundary
+        status: "[ ]"
+        notes: ""
+      - id: CON-04
+        category: CONNECTIVITY
+        check: max_connections and active connection count
+        status: "[ ]"
+        notes: ""
+      - id: MON-01
+        category: MONITORING
+        check: PostgreSQL log clean startup
+        status: "[ ]"
+        notes: ""
+      - id: MON-02
+        category: MONITORING
+        check: postgresql.auto.conf overrides loaded
+        status: "[ ]"
+        notes: ""
+      - id: MON-03
+        category: MONITORING
+        check: pg_stat_bgwriter checkpoint health
+        status: "[ ]"
+        notes: ""
+      - id: BAK-01
+        category: BACKUP
+        check: WAL level and archive_mode documented
+        status: "[ ]"
+        notes: ""
+      - id: BAK-02
+        category: BACKUP
+        check: pg_dump baseline succeeds
+        status: "[ ]"
+        notes: ""
+      - id: PERF-01
+        category: PERFORMANCE
+        check: Tuned parameters active in pg_settings
+        status: "[ ]"
+        notes: ""
+      - id: PERF-02
+        category: PERFORMANCE
+        check: No OOM events / memory headroom
+        status: "[ ]"
+        notes: ""
+      - id: PERF-03
+        category: PERFORMANCE
+        check: Disk I/O baseline acceptable
+        status: "[ ]"
+        notes: ""
+      - id: PERF-04
+        category: PERFORMANCE
+        check: Autovacuum enabled and running
+        status: "[ ]"
+        notes: ""
+
+  production_promotion_blockers:
+    description: >
+      The following findings from this checklist are HARD BLOCKERS for any
+      production promotion of this environment. Do not treat as lab-only accepted risks.
+    blockers:
+      - id: SEC-04
+        reason: cloud-init password 'Lab@2024!' must be rotated and stored in Azure Key Vault before production use
+      - id: SEC-05
+        reason: Self-signed TLS certificate must be replaced with a CA-signed cert or Azure-managed cert
+      - id: SEC-06
+        reason: log_connections must be enabled and logs shipped to a SIEM or Log Analytics Workspace
+      - id: BAK-01
+        reason: archive_mode = off means zero PITR capability; enable with Azure Blob Storage archive command
+      - id: BAK-02
+        reason: Automated scheduled pg_dump or Azure Backup for PostgreSQL must be configured
