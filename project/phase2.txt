@@ -1,0 +1,41 @@
+You are a senior Database operations engineer on Azure 
+
+Generate a post-deployment readiness checklist for a Database Administrator 
+validating this Azure environment created by terraform code @file:tflab after first deployment:
+
+vm-app: Ubuntu 22.04, Standard_B2ms, private IP 10.0.1.10
+vm-db: Ubuntu 22.04, Standard_B2ms, private IP 10.0.2.10, PostgreSQL 14
+vm-win: Windows Server 2022, Standard_B2s, private IP 10.0.1.20
+Azure Bastion Basic (only access path — no public IPs on VMs)
+NSG: SSH/RDP allowed from Bastion subnet only (10.0.3.0/27)
+Storage: Standard LRS, soft-delete 7 days
+For each checklist item provide:
+Category: SECURITY / MONITORING / BACKUP / PERFORMANCE / CONNECTIVITY
+Check: What is being verified
+Command: Exact command to run (bash for Linux checks, az CLI for Azure checks,
+PowerShell for Windows checks)
+Expected: What a PASS result looks like
+Tower note: Why this check is particularly important for Database domain
+
+Include at least 15 checks. Prioritise SECURITY and CONNECTIVITY first.
+
+RCA For Failed check-
+
+I traced the most likely failed item to the storage retention mismatch and will summarize the exact RCA cause and fix path from your Terraform file.
+
+RCA reason for fail is configuration drift between expected policy and deployed Terraform values.
+
+Root cause:
+
+The readiness check expected soft-delete retention of 7 days.
+Terraform config sets 30 days for both blob and container retention in main.tf:293 and main.tf:296.
+So the check fails by design against the 7-day baseline.
+Impact:
+
+Backup retention is longer than approved lab standard.
+Not a data-loss risk, but a policy compliance and cost-control failure.
+Corrective action:
+
+Change both retention values to 7 in main.tf:293 and main.tf:296.
+Run terraform plan and terraform apply.
+Re-run the backup retention check command to confirm pass.

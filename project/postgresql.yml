@@ -1,0 +1,274 @@
+---
+dba_post_deployment_readiness_checklist:
+  metadata:
+    name: PostgreSQL 14 DBA Readiness Checklist
+    scope: Azure environment validation after first Terraform deployment
+    environment: rg-ailab-nikhil
+    region: eastus
+    vm_app: "Ubuntu 22.04, Standard_B2ms, 10.0.1.10"
+    vm_db: "Ubuntu 22.04, Standard_B2ms, 10.0.2.10, PostgreSQL 14"
+    vm_win: "Windows Server 2022, Standard_B2s, 10.0.1.20"
+    bastion: "bastion-ailab (Basic), AzureBastionSubnet 10.0.3.0/27"
+    sign_off_rule: >
+      SECURITY and CONNECTIVITY checks must pass before DBA sign-off.
+      MONITORING, BACKUP, and PERFORMANCE checks require documented evidence.
+
+  checks:
+    - id: SEC-01
+      category: SECURITY
+      check: VM NICs have no public IP addresses.
+      command:
+        shell: az cli
+        run: |
+          az network nic show -g rg-ailab-nikhil -n nic-app --query "ipConfigurations[].publicIPAddress.id" -o tsv
+          az network nic show -g rg-ailab-nikhil -n nic-db --query "ipConfigurations[].publicIPAddress.id" -o tsv
+          az network nic show -g rg-ailab-nikhil -n nic-win --query "ipConfigurations[].publicIPAddress.id" -o tsv
+      expected: "All commands return blank output."
+      tower_note: "Preventing direct internet exposure is baseline control for database hosts."
+
+    - id: SEC-02
+      category: SECURITY
+      check: Bastion is deployed and in Succeeded state.
+      command:
+        shell: az cli
+        run: |
+          az network bastion show -g rg-ailab-nikhil -n bastion-ailab --query "{name:name,sku:sku.name,state:provisioningState,subnet:ipConfigurations[0].subnet.id}" -o yaml
+      expected: "state=Succeeded, sku=Basic, subnet path contains AzureBastionSubnet."
+      tower_note: "Bastion-only administration enforces controlled ingress for privileged access."
+
+    - id: SEC-03
+      category: SECURITY
+      check: SSH is allowed only from Bastion subnet.
+      command:
+        shell: az cli
+        run: |
+          az network nsg rule show -g rg-ailab-nikhil --nsg-name nsg-app -n AllowSSH --query "{src:sourceAddressPrefix,dstPort:destinationPortRange,access:access}" -o yaml
+      expected: "src=10.0.3.0/27, dstPort=22, access=Allow."
+      tower_note: "Restricts Linux admin-plane exposure to approved jump path."
+
+    - id: SEC-04
+      category: SECURITY
+      check: RDP is allowed only from Bastion subnet.
+      command:
+        shell: az cli
+        run: |
+          az network nsg rule show -g rg-ailab-nikhil --nsg-name nsg-app -n AllowRDP --query "{src:sourceAddressPrefix,dstPort:destinationPortRange,access:access}" -o yaml
+      expected: "src=10.0.3.0/27, dstPort=3389, access=Allow."
+      tower_note: "Constrained Windows administration reduces lateral movement risk."
+
+    - id: SEC-05
+      category: SECURITY
+      check: PostgreSQL port is restricted to app subnet in DB NSG.
+      command:
+        shell: az cli
+        run: |
+          az network nsg rule show -g rg-ailab-nikhil --nsg-name nsg-db -n AllowPostgres --query "{src:sourceAddressPrefix,dstPort:destinationPortRange,protocol:protocol,access:access}" -o yaml
+      expected: "src=10.0.1.0/24, dstPort=5432, protocol=Tcp, access=Allow."
+      tower_note: "Network-level scope must be minimal for data-tier ports."
+
+    - id: SEC-06
+      category: SECURITY
+      check: PostgreSQL listens on private DB IP only.
+      command:
+        shell: bash
+        run: |
+          sudo -u postgres psql -c "SHOW listen_addresses;"
+          ss -tlnp | grep 5432
+      expected: "listen_addresses shows 10.0.2.10 and socket bind is 10.0.2.10:5432 only."
+      tower_note: "Avoids wildcard binds that can expose DB when interfaces change."
+
+    - id: SEC-07
+      category: SECURITY
+      check: pg_hba.conf has subnet-scoped md5 rule and no host trust entries.
+      command:
+        shell: bash
+        run: |
+          sudo grep -v '^#\|^$' /etc/postgresql/14/main/pg_hba.conf
+      expected: "Contains 'host labdb labuser 10.0.1.0/24 md5' and no 'host ... trust' lines."
+      tower_note: "Host-based authentication is the last DB-layer gate after NSG controls."
+
+    - id: SEC-08
+      category: SECURITY
+      check: Application role has least privilege and owns lab database only.
+      command:
+        shell: bash
+        run: |
+          sudo -u postgres psql -c "SELECT rolname, rolsuper, rolcreatedb, rolcreaterole, rolcanlogin FROM pg_roles WHERE rolname='labuser';"
+          sudo -u postgres psql -c "SELECT datname, pg_get_userbyid(datdba) AS owner FROM pg_database WHERE datname='labdb';"
+      expected: "rolsuper=false, rolcreatedb=false, rolcreaterole=false, rolcanlogin=true, owner=labuser."
+      tower_note: "Over-privileged app roles convert app compromise into full DB compromise."
+
+    - id: CON-01
+      category: CONNECTIVITY
+      check: End-to-end DB login from vm-app works.
+      command:
+        shell: bash
+        run: |
+          PGPASSWORD='Lab@2024!' psql -h 10.0.2.10 -U labuser -d labdb -c "SELECT current_database(), current_user, inet_server_addr(), inet_server_port();"
+      expected: "Returns labdb, labuser, 10.0.2.10, 5432 with no FATAL errors."
+      tower_note: "Validates NSG path, PostgreSQL socket, pg_hba auth, and catalog objects together."
+
+    - id: CON-02
+      category: CONNECTIVITY
+      check: PostgreSQL service is active and enabled on vm-db.
+      command:
+        shell: bash
+        run: |
+          systemctl is-active postgresql
+          systemctl is-enabled postgresql
+      expected: "active and enabled."
+      tower_note: "Ensures DB remains reachable after reboot and maintenance cycles."
+
+    - id: CON-03
+      category: CONNECTIVITY
+      check: TCP connectivity from vm-app to vm-db:5432 is open.
+      command:
+        shell: bash
+        run: |
+          nc -zv 10.0.2.10 5432
+      expected: "Connection to 10.0.2.10 5432 succeeded."
+      tower_note: "Separates network faults from SQL/authentication faults quickly."
+
+    - id: CON-04
+      category: CONNECTIVITY
+      check: vm-win reachability to 5432 is measured and documented.
+      command:
+        shell: powershell
+        run: |
+          Test-NetConnection -ComputerName 10.0.2.10 -Port 5432 | Select-Object ComputerName,RemotePort,TcpTestSucceeded
+      expected: "Command returns TcpTestSucceeded state; result is recorded in readiness evidence."
+      tower_note: "Shared subnets can create unintended DB client paths from non-app nodes."
+
+    - id: MON-01
+      category: MONITORING
+      check: Connection logging settings are enabled.
+      command:
+        shell: bash
+        run: |
+          sudo -u postgres psql -c "SELECT name, setting FROM pg_settings WHERE name IN ('logging_collector','log_connections','log_disconnections','log_line_prefix');"
+      expected: "logging_collector=on, log_connections=on, log_disconnections=on."
+      tower_note: "Connection audit trails are mandatory for incident reconstruction."
+
+    - id: MON-02
+      category: MONITORING
+      check: PostgreSQL logs rotate and retention is bounded.
+      command:
+        shell: bash
+        run: |
+          sudo cat /etc/logrotate.d/postgresql
+          sudo ls -lh /var/log/postgresql/
+      expected: "Daily rotation policy exists with finite rotate count and compression."
+      tower_note: "Unbounded logs can fill OS disk and cause DB outage."
+
+    - id: MON-03
+      category: MONITORING
+      check: Idle connection leak script executes successfully.
+      command:
+        shell: bash
+        run: |
+          sudo /usr/local/bin/check-idle-connections.sh
+      expected: "Script runs and outputs idle/idle-in-transaction session report."
+      tower_note: "Detects connection leaks before max_connections is exhausted."
+
+    - id: BAK-01
+      category: BACKUP
+      check: Storage account is Standard_LRS with 7-day soft-delete policy.
+      command:
+        shell: az cli
+        run: |
+          az storage account show -g rg-ailab-nikhil -n stailabnikhil --query "sku.name" -o tsv
+          az storage account blob-service-properties show -g rg-ailab-nikhil -n stailabnikhil --query "{blobDeleteEnabled:deleteRetentionPolicy.enabled,blobDeleteDays:deleteRetentionPolicy.days,containerDeleteEnabled:containerDeleteRetentionPolicy.enabled,containerDeleteDays:containerDeleteRetentionPolicy.days}" -o yaml
+      expected: "sku=Standard_LRS, blobDeleteEnabled=true, blobDeleteDays=7, containerDeleteEnabled=true, containerDeleteDays=7."
+      tower_note: "Soft-delete duration defines recoverability window for backup artifacts."
+
+    - id: BAK-02
+      category: BACKUP
+      check: Logical backup and archive validation run successfully.
+      command:
+        shell: bash
+        run: |
+          sudo -u postgres pg_dump -Fc labdb -f /var/backups/labdb_$(date +%F).dump
+          pg_restore -l /var/backups/labdb_$(date +%F).dump | head -20
+      expected: "Dump file exists with non-zero size and pg_restore -l lists TOC entries without errors."
+      tower_note: "A backup is not valid until it can be parsed for restore readiness."
+
+    - id: PER-01
+      category: PERFORMANCE
+      check: Connection pressure remains below warning threshold.
+      command:
+        shell: bash
+        run: |
+          sudo -u postgres psql -c "SELECT count(*) AS active_connections, current_setting('max_connections')::int AS max_connections, round((count(*)::numeric/current_setting('max_connections')::int)*100,2) AS pct_used FROM pg_stat_activity;"
+      expected: "pct_used remains below 80% during normal exercises."
+      tower_note: "Connection saturation is a common first failure mode on small DB SKUs."
+
+    - id: PER-02
+      category: PERFORMANCE
+      check: Baseline memory settings are explicitly configured.
+      command:
+        shell: bash
+        run: |
+          sudo -u postgres psql -c "SHOW shared_buffers;"
+          sudo -u postgres psql -c "SHOW effective_cache_size;"
+          sudo -u postgres psql -c "SHOW work_mem;"
+      expected: "All values are explicitly set per approved DBA sizing baseline."
+      tower_note: "Defaults on small VMs can cause poor plans and excessive temp spill under load."
+
+  failed_check_rca_guide:
+    purpose: >
+      Use this RCA format for any failed readiness item before closure.
+      A failed check is not complete until remediation is verified with rerun evidence.
+    required_fields:
+      - check_id
+      - category
+      - failed_command
+      - observed_output
+      - expected_output
+      - impact_assessment
+      - root_cause
+      - corrective_action
+      - preventive_action
+      - owner
+      - target_fix_time_utc
+      - validation_rerun_command
+      - validation_result
+
+    rca_template:
+      check_id: "<example: BAK-01>"
+      category: "<SECURITY|CONNECTIVITY|MONITORING|BACKUP|PERFORMANCE>"
+      failed_command: "<exact command run>"
+      observed_output: "<actual output snippet>"
+      expected_output: "<pass criteria from checklist>"
+      impact_assessment: "<service/compliance/data risk impact>"
+      root_cause: "<technical reason for mismatch>"
+      corrective_action: "<immediate fix action>"
+      preventive_action: "<IaC/policy/monitoring control to prevent recurrence>"
+      owner: "<name/team>"
+      target_fix_time_utc: "<YYYY-MM-DDTHH:MM:SSZ>"
+      validation_rerun_command: "<same check command or stronger validation>"
+      validation_result: "<PASS|FAIL + evidence reference>"
+
+    example_rca:
+      check_id: BAK-01
+      category: BACKUP
+      failed_command: >
+        az storage account blob-service-properties show -g rg-ailab-nikhil -n stailabnikhil
+        --query "{blobDeleteDays:deleteRetentionPolicy.days,containerDeleteDays:containerDeleteRetentionPolicy.days}" -o yaml
+      observed_output: "blobDeleteDays=30, containerDeleteDays=30"
+      expected_output: "blobDeleteDays=7, containerDeleteDays=7"
+      impact_assessment: >
+        Retention policy does not match approved baseline. Recovery window is larger than required,
+        increasing cost and indicating configuration drift from target standard.
+      root_cause: >
+        Terraform configuration in tflab sets delete_retention_policy.days and
+        container_delete_retention_policy.days to 30.
+      corrective_action: >
+        Update Terraform to 7-day retention and apply: terraform plan; terraform apply.
+      preventive_action: >
+        Add CI policy check (tfsec/OPA) that fails PRs when retention is not 7 for this lab profile.
+      owner: "Cloud Platform + DBA"
+      target_fix_time_utc: "2026-06-20T12:00:00Z"
+      validation_rerun_command: >
+        az storage account blob-service-properties show -g rg-ailab-nikhil -n stailabnikhil
+        --query "{blobDeleteDays:deleteRetentionPolicy.days,containerDeleteDays:containerDeleteRetentionPolicy.days}" -o yaml
+      validation_result: "Pending rerun after Terraform apply"

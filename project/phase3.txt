@@ -1,0 +1,21 @@
+You are a senior database monitoring engineer.
+
+Based on the FinBridge incident analysis, design alert suppression rules
+that would reduce the 280- db alert storm to the 10-15 alerts that actually matter.
+
+Root cause confirmed: NSG rule change blocked DB connectivity at 09:14:03.
+
+Primary alerts that must ALWAYS fire (never suppress):
+  - NSG rule modification (ALT-001)
+  - First DB connection failure from app (ALT-007)
+  - PostgreSQL connection exhaustion (ALT-030)
+  - Payment service crash (ALT-045)
+
+please provide RCA for the issue-
+
+RCA statement you can use in incident report:
+
+Incident was caused by an NSG rule change at 09:14:03 that blocked app-to-DB connectivity.
+The alert flood was a monitoring design gap: lack of dependency-aware correlation and duplicate suppression allowed downstream symptoms to page independently.
+Corrective action is to enforce parent-child suppression anchored on ALT-001 while preserving mandatory critical signals ALT-001, ALT-007, ALT-030, and ALT-045.
+

@@ -1,0 +1,524 @@
+---
+resilience_test_plan:
+  metadata:
+    name: FinBridge Lab Resilience Test Plan
+    environment: rg-ailab-nikhil
+    region: eastus
+    created: "2026-06-16"
+    author: senior-cloud-resilience-engineer
+    version: "1.0"
+    constraints:
+      - All tests reversible within 5 minutes
+      - Zero data loss during any test
+      - Go/no-go check mandatory before each scenario
+
+  environment:
+    vms:
+      - name: vm-app
+        os: Ubuntu 22.04
+        sku: Standard_B2ms
+        private_ip: "10.0.1.10"
+        subnet: snet-app
+      - name: vm-db
+        os: Ubuntu 22.04
+        sku: Standard_B2ms
+        private_ip: "10.0.2.10"
+        subnet: snet-db
+        workload: PostgreSQL 14
+      - name: vm-win
+        os: Windows Server 2022
+        sku: Standard_B2s
+        private_ip: "10.0.1.20"
+        subnet: snet-app
+    access:
+      method: Azure Bastion Basic
+      bastion_name: bastion-ailab
+      bastion_subnet: "10.0.3.0/27"
+      public_ips_on_vms: false
+    storage:
+      name: stailabnikhil
+      replication: Standard_LRS
+      soft_delete_days: 7
+
+  universal_pre_test_baseline:
+    description: Run before every scenario. Abort all testing if any check fails.
+    checks:
+      - name: All VMs running
+        command: >
+          az vm list -g rg-ailab-nikhil --show-details
+          --query "[].{Name:name, State:powerState, IP:privateIps}" -o table
+        pass_criteria: All three VMs show "VM running"
+      - name: Bastion healthy
+        command: >
+          az network bastion show -g rg-ailab-nikhil -n bastion-ailab
+          --query "{state:provisioningState}" -o tsv
+        pass_criteria: "Succeeded"
+
+  scenarios:
+
+    - id: A
+      name: vm-app CPU Exhaustion
+      description: >
+        Simulates the payment processing service receiving a transaction surge
+        that pegs all CPU cores on vm-app (Standard_B2ms — 2 vCPUs).
+
+      go_no_go:
+        target_vm: vm-app
+        shell: bash
+        commands:
+          - description: Confirm no existing high-CPU processes
+            command: "top -bn1 | head -20"
+          - description: Check B2ms CPU burst credit balance (must be > 60)
+            command: >
+              az monitor metrics list
+              --resource $(az vm show -g rg-ailab-nikhil -n vm-app --query id -o tsv)
+              --metric "CPU Credits Remaining"
+              --interval PT1M
+              --query "value[0].timeseries[0].data[-1].average" -o tsv
+          - description: Ensure stress-ng is installed
+            command: "which stress-ng || sudo apt-get install -y stress-ng"
+        pass_criteria:
+          - CPU Credits Remaining > 60
+          - Load average < 1.0
+        abort_if: CPU Credits < 60 (VM already throttled — test results invalid)
+
+      failure_trigger:
+        target_vm: vm-app
+        shell: bash
+        commands:
+          - description: Consume both vCPUs for 90 seconds (auto-terminates)
+            command: >
+              stress-ng --cpu 2 --timeout 90s --metrics-brief &
+              STRESS_PID=$!
+              echo "Stress PID: $STRESS_PID — auto-terminates in 90s"
+
+      expected_impact:
+        vm_app: "CPU 100%, load average ~2.0, burst credits drain at ~2/min, SSH response slows"
+        vm_db: "No impact — PostgreSQL idle if app cannot process new requests"
+        vm_win: "No impact"
+        bastion: "SSH latency to vm-app increases; session remains open"
+        storage: "No impact"
+
+      recovery:
+        shell: bash
+        command: >
+          kill $STRESS_PID 2>/dev/null || pkill -f stress-ng
+          echo "Recovery triggered at: $(date -u)"
+        note: stress-ng auto-terminates at 90s; manual kill only needed if operator loses session
+
+      validation:
+        shell: bash
+        commands:
+          - description: Confirm CPU returned to baseline
+            command: "top -bn1 | grep 'Cpu(s)' | awk '{print \"CPU idle: \" $8 \"%\"}'"
+            pass_criteria: "idle > 90%"
+          - description: Confirm load average normalised
+            command: "uptime"
+            pass_criteria: "1-min load average < 0.5"
+          - description: Verify CPU metric trending down
+            command: >
+              az monitor metrics list
+              --resource $(az vm show -g rg-ailab-nikhil -n vm-app --query id -o tsv)
+              --metric "Percentage CPU" --interval PT1M
+              --query "value[0].timeseries[0].data[-3:]" -o table
+            pass_criteria: "CPU % trending back toward 0–5%"
+
+      rto_target:
+        automatic_seconds: 90
+        manual_seconds: 30
+        credit_recovery_note: ~30 min for burst credit restore — VM fully functional before credits recover
+
+    # -------------------------------------------------------------------------
+
+    - id: B
+      name: DB Connection Pool Exhaustion
+      description: >
+        Simulates all 20 PostgreSQL connections being held open (e.g., application
+        connection leak or hung queries), blocking all new connections from the
+        payment service.
+
+      go_no_go:
+        target_vm: vm-db
+        shell: bash
+        commands:
+          - description: Confirm active connections are below 15
+            command: >
+              sudo -u postgres psql -c "
+              SELECT count(*) AS active_connections,
+                     (SELECT setting::int FROM pg_settings WHERE name='max_connections') AS max_conn
+              FROM pg_stat_activity
+              WHERE state IS NOT NULL;"
+          - description: Confirm labdb is reachable (run on vm-app)
+            command: "PGPASSWORD='Lab@2024!' psql -h 10.0.2.10 -U labuser -d labdb -c \"\\conninfo\""
+        pass_criteria:
+          - active_connections < 15
+        abort_if: connections >= 15 (existing load would make test results unpredictable)
+
+      failure_trigger:
+        target_vm: vm-app
+        shell: bash
+        commands:
+          - description: Open 19 idle connections holding pg_sleep for 120 seconds
+            command: >
+              for i in $(seq 1 19); do
+                PGPASSWORD='Lab@2024!' psql -h 10.0.2.10 -U labuser -d labdb
+                  -c "SELECT pg_sleep(120); -- connection $i" &
+              done
+              echo "Opened 19 connections. PIDs: $(jobs -p)"
+          - description: Confirm 20th connection is rejected
+            command: >
+              sleep 2 &&
+              PGPASSWORD='Lab@2024!' psql -h 10.0.2.10 -U labuser -d labdb
+                -c "SELECT 'pool exhausted test';" 2>&1 | grep -E "FATAL|too many"
+            expected_output: "FATAL: sorry, too many clients already"
+
+      expected_impact:
+        vm_app: "New DB connection attempts fail with FATAL: sorry, too many clients already"
+        vm_db: "PostgreSQL accepts no new non-superuser connections; pg_stat_activity shows 19 rows"
+        vm_win: "No direct DB connectivity; unaffected"
+        bastion: "No impact"
+        storage: "No impact"
+
+      recovery:
+        shell: bash
+        command: >
+          kill $(jobs -p) 2>/dev/null
+          pkill -f "pg_sleep" 2>/dev/null
+          echo "All held connections released at: $(date -u)"
+
+      validation:
+        shell: bash
+        commands:
+          - description: Confirm connections drained on vm-db
+            command: >
+              sudo -u postgres psql -c "
+              SELECT count(*) AS remaining_connections
+              FROM pg_stat_activity
+              WHERE datname = 'labdb' AND state IS NOT NULL;"
+            pass_criteria: "count = 0 or 1 (superuser monitoring connection only)"
+          - description: Confirm new connection succeeds from vm-app
+            command: >
+              PGPASSWORD='Lab@2024!' psql -h 10.0.2.10 -U labuser -d labdb
+                -c "SELECT 'connection pool recovered' AS status, now() AS ts;"
+            pass_criteria: Returns one row with status text
+
+      rto_target:
+        manual_seconds: 5
+        automatic_seconds: 120
+        note: pg_sleep(120) auto-terminates all held connections within 2 minutes without manual kill
+
+    # -------------------------------------------------------------------------
+
+    - id: C
+      name: Disk Fill on vm-app
+      description: >
+        Simulates a runaway log writer or bulk data export filling the OS disk,
+        causing the application to fail on any write operation (logs, temp files,
+        PID files). Uses a sparse fallocate file — no actual data written to blocks.
+
+      go_no_go:
+        target_vm: vm-app
+        shell: bash
+        commands:
+          - description: Check disk free space (must be > 10 GB)
+            command: "df -h / | awk 'NR==2 {print \"Used: \" $3 \" / \" $2 \" — Available: \" $4 \" — Use%: \" $5}'"
+          - description: Confirm /tmp is on the same filesystem
+            command: "df -h /tmp | awk 'NR==2 {print \"/tmp filesystem: \" $1}'"
+          - description: Record inode baseline
+            command: "df -i / | awk 'NR==2 {print \"Inode use%: \" $5}'"
+        pass_criteria:
+          - Available > 10G
+          - Use% < 70%
+        abort_if: Available < 10G (insufficient headroom — test would leave system unstable)
+
+      failure_trigger:
+        target_vm: vm-app
+        shell: bash
+        commands:
+          - description: Allocate sparse file consuming 90% of available free space
+            command: >
+              AVAIL_KB=$(df --output=avail / | tail -1)
+              FILL_KB=$(( AVAIL_KB * 90 / 100 ))
+              FILL_GB=$(( FILL_KB / 1024 / 1024 ))
+              echo "Allocating ${FILL_GB}GB sparse file to reach ~95% disk usage..."
+              fallocate -l ${FILL_KB}K /tmp/diskfill.img
+              echo "Disk fill complete at: $(date -u)"
+              df -h /
+          - description: Confirm writes now fail
+            command: "dd if=/dev/zero of=/tmp/writefailtest bs=1M count=100 2>&1 | tail -3"
+            expected_output: "No space left on device"
+        warnings:
+          - Do NOT run sudo apt, systemctl restart, or any service that writes to disk during the test
+          - Those operations may leave services broken beyond the test window
+
+      expected_impact:
+        vm_app: >
+          All writes to / fail: application log rotation fails, temp file creation fails,
+          any transaction writing to disk errors; SSH session may warn disk quota exceeded
+        vm_db: "Unaffected — separate VM and disk"
+        vm_win: "Unaffected"
+        bastion: "SSH session stays open (TCP/in-memory); new sessions may fail if vm-app cannot write session keys"
+        storage: "No impact — boot diagnostics use a separate storage account endpoint"
+
+      recovery:
+        shell: bash
+        command: >
+          rm -f /tmp/diskfill.img
+          rm -f /tmp/writefailtest 2>/dev/null
+          echo "Disk freed at: $(date -u)"
+          df -h /
+        note: fallocate sparse file — rm is instant regardless of allocated size
+
+      validation:
+        shell: bash
+        commands:
+          - description: Confirm write operations succeed
+            command: >
+              dd if=/dev/zero of=/tmp/writetest bs=1M count=10 &&
+              echo "PASS: writes succeeding" &&
+              rm -f /tmp/writetest
+            pass_criteria: dd completes without error
+          - description: Confirm disk usage returned to baseline
+            command: >
+              df -h / | awk 'NR==2 {
+                if ($5+0 < 70) print "PASS: disk use " $5
+                else print "WARN: disk still at " $5 " — check for other large files"
+              }'
+            pass_criteria: "Use% < 70%"
+          - description: Confirm syslog is writable (critical system service)
+            command: >
+              logger "resilience-test-C: disk recovery validated at $(date -u)"
+              sudo grep "resilience-test-C" /var/log/syslog | tail -1
+            pass_criteria: Log entry appears within 2 seconds
+          - description: Check for crashed services during disk-full window
+            command: "systemctl --failed"
+            pass_criteria: "0 loaded units listed"
+
+      rto_target:
+        manual_seconds: 5
+        note: rm on sparse file is instant. Check systemctl --failed after recovery for any daemons that crashed during test.
+
+    # -------------------------------------------------------------------------
+
+    - id: D
+      name: Network Routing Misconfiguration
+      description: >
+        Simulates an operator applying an incorrect iptables rule that severs the
+        application-to-database network path — the most common cause of total payment
+        service outage in this architecture. Uses host firewall (iptables) scoped to
+        port 5432 only. Does NOT touch NSG rules to avoid accidentally locking out Bastion.
+
+      go_no_go:
+        target_vm: vm-db
+        shell: bash
+        commands:
+          - description: Confirm iptables is clean — no pre-existing 5432 DROP rules
+            command: "sudo iptables -L INPUT -n --line-numbers | grep -E '5432|DROP' || echo 'Clean — no existing 5432 rules'"
+          - description: Confirm app-to-db connectivity is currently working (run on vm-app)
+            command: "nc -zvw 3 10.0.2.10 5432 && echo 'PRE-TEST: connectivity OK'"
+          - description: Snapshot current iptables state for guaranteed rollback
+            command: "sudo iptables-save > /tmp/iptables-backup-$(date +%Y%m%d%H%M%S).rules && ls -la /tmp/iptables-backup-*.rules"
+        pass_criteria:
+          - No existing DROP rules for port 5432
+          - nc test returns "succeeded"
+        abort_if: Connectivity already broken (test meaningless and may mask existing incident)
+        session_note: >
+          Open TWO concurrent Bastion sessions before starting — one on vm-db
+          to manage iptables, one on vm-app to validate the network break and recovery.
+
+      failure_trigger:
+        target_vm: vm-db
+        shell: bash
+        commands:
+          - description: Insert DROP rule at position 1 for port 5432 from app subnet only
+            command: >
+              sudo iptables -I INPUT 1
+                -s 10.0.1.0/24
+                -p tcp --dport 5432
+                -j DROP
+                -m comment --comment "RESILIENCE-TEST-D-$(date +%H%M%S)"
+              echo "Rule inserted at: $(date -u)"
+              sudo iptables -L INPUT -n --line-numbers | head -5
+          - description: Verify failure from vm-app (second Bastion session)
+            command: "nc -zvw 5 10.0.2.10 5432"
+            expected_output: "Connection timed out (after 5 seconds — DROP silently discards packets)"
+        safety_note: >
+          Rule scoped to port 5432 and source 10.0.1.0/24 only.
+          SSH from Bastion subnet 10.0.3.0/27 is NOT affected — operator keeps session.
+
+      expected_impact:
+        vm_app: >
+          DB connection attempts hang for TCP timeout duration (~2 min without app-level timeout);
+          new DB calls fail; existing pooled connections survive until keepalive detects black-hole
+        vm_db: >
+          PostgreSQL process unaffected — iptables drops packets before reaching socket;
+          DB log shows no new connection entries
+        vm_win: "Unaffected (no DB dependency configured)"
+        bastion: "SSH to both VMs unaffected — uses port 22 from 10.0.3.0/27, not in scope"
+        storage: "No impact"
+
+      recovery:
+        shell: bash
+        primary_command: >
+          sudo iptables -D INPUT
+            -s 10.0.1.0/24
+            -p tcp --dport 5432
+            -j DROP
+          echo "Rule removed at: $(date -u)"
+        fallback_command: >
+          sudo iptables-restore < /tmp/iptables-backup-*.rules
+          echo "Full iptables state restored from snapshot"
+        note: Use fallback only if primary fails due to comment mismatch
+
+      validation:
+        shell: bash
+        commands:
+          - description: Immediate port connectivity check (run on vm-app)
+            command: "nc -zvw 3 10.0.2.10 5432 && echo 'PASS: port 5432 reachable'"
+            pass_criteria: "Connection succeeded"
+          - description: Full end-to-end DB authentication (run on vm-app)
+            command: >
+              PGPASSWORD='Lab@2024!' psql -h 10.0.2.10 -U labuser -d labdb
+                -c "SELECT 'network routing restored' AS status, pg_postmaster_start_time() AS db_uptime;"
+            pass_criteria: Returns one row confirming TCP, auth, and DB health
+          - description: Confirm no residual DROP rules remain (run on vm-db)
+            command: "sudo iptables -L INPUT -n | grep DROP || echo 'PASS: iptables clean'"
+            pass_criteria: "No DROP rules present"
+
+      rto_target:
+        manual_seconds: 30
+        note: Rule deletion is instant. TCP connections recover on next retry. No service restarts required.
+
+    # -------------------------------------------------------------------------
+
+    - id: E
+      name: Windows IIS Service Failure
+      description: >
+        Simulates the reporting service (IIS/W3SVC) crashing on vm-win — e.g.,
+        due to a failed application pool recycle, config corruption, or port conflict —
+        making all reporting dashboards unavailable.
+
+      go_no_go:
+        target_vm: vm-win
+        shell: powershell
+        commands:
+          - description: Confirm IIS role is installed
+            command: "Get-WindowsFeature -Name Web-Server | Select-Object Name, InstallState"
+            pass_criteria: "InstallState = Installed"
+            remediation_if_absent: "Install-WindowsFeature -Name Web-Server -IncludeManagementTools"
+          - description: Confirm W3SVC is running with Automatic start
+            command: "Get-Service -Name W3SVC | Select-Object Name, Status, StartType"
+            pass_criteria: "Status = Running, StartType = Automatic"
+          - description: Confirm Default Web Site responds locally
+            command: "Invoke-WebRequest -Uri 'http://localhost' -UseBasicParsing -TimeoutSec 5 | Select-Object StatusCode, StatusDescription"
+            pass_criteria: "StatusCode = 200"
+          - description: Check for pre-existing App Pool failures
+            command: "Get-WebConfiguration -Filter 'system.applicationHost/applicationPools/add' | Select-Object Name, State"
+            pass_criteria: All App Pools show state = Started
+        abort_if: W3SVC not running or IIS role not installed
+
+      failure_trigger:
+        target_vm: vm-win
+        shell: powershell
+        commands:
+          - description: Stop IIS service gracefully (StartType Automatic preserved — non-persistent)
+            command: >
+              Stop-Service -Name W3SVC -Force
+              Write-Output "W3SVC stopped at: $((Get-Date).ToUniversalTime().ToString('u'))"
+              Get-Service -Name W3SVC | Select-Object Name, Status
+            expected_output: "Status = Stopped"
+          - description: Confirm HTTP requests now fail
+            command: >
+              try {
+                  Invoke-WebRequest -Uri 'http://localhost' -UseBasicParsing -TimeoutSec 3
+              } catch {
+                  Write-Output "EXPECTED FAILURE: $($_.Exception.Message)"
+              }
+            expected_output: "Unable to connect to the remote server"
+
+      expected_impact:
+        vm_win: >
+          IIS stops serving HTTP/HTTPS; all web endpoints return connection refused;
+          App Pools stopped; WAS dependency may also stop
+        vm_app: >
+          If vm-app calls a reporting API on vm-win, those calls will time out
+          or return connection refused errors
+        vm_db: "No impact — vm-win has no DB dependency configured"
+        bastion: "RDP session to vm-win unaffected — RDP uses port 3389 (separate from IIS)"
+        storage: "No impact"
+
+      recovery:
+        shell: powershell
+        command: >
+          Start-Service -Name W3SVC
+          Write-Output "W3SVC start initiated at: $((Get-Date).ToUniversalTime().ToString('u'))"
+          $timeout = 30; $elapsed = 0
+          do {
+              Start-Sleep -Seconds 2; $elapsed += 2
+              $status = (Get-Service -Name W3SVC).Status
+              Write-Output "[$elapsed s] W3SVC status: $status"
+          } while ($status -ne "Running" -and $elapsed -lt $timeout)
+          if ($status -eq "Running") {
+              Write-Output "RECOVERY COMPLETE at: $((Get-Date).ToUniversalTime().ToString('u'))"
+          } else {
+              Write-Output "WARNING: Service did not reach Running within ${timeout}s — check Event Log"
+          }
+
+      validation:
+        shell: powershell
+        commands:
+          - description: Service state check
+            command: "Get-Service -Name W3SVC | Select-Object Name, Status, StartType"
+            pass_criteria: "Status = Running, StartType = Automatic"
+          - description: HTTP response end-to-end check
+            command: >
+              $response = Invoke-WebRequest -Uri 'http://localhost' -UseBasicParsing -TimeoutSec 10
+              Write-Output "HTTP Status: $($response.StatusCode) $($response.StatusDescription)"
+            pass_criteria: "200 OK (or 302/404 — confirms IIS is serving)"
+          - description: App Pool recovery check
+            command: >
+              Import-Module WebAdministration
+              Get-WebConfiguration -Filter 'system.applicationHost/applicationPools/add' |
+                Select-Object Name, @{N="State";E={(Get-WebConfigurationProperty -Filter $_.ItemXPath -Name state).Value}}
+            pass_criteria: All App Pools show State = Started
+          - description: Event log — confirm no crash-restart loop
+            command: >
+              Get-EventLog -LogName System -Source "Service Control Manager" -Newest 5 |
+                Where-Object { $_.Message -match "W3SVC" } |
+                Select-Object TimeGenerated, EntryType, Message
+            pass_criteria: Last entry is "W3SVC entered the running state" with no preceding errors
+
+      rto_target:
+        manual_seconds: 60
+        note: W3SVC cold start 5–15s; App Pool worker process spin-up adds 2–5s on first request
+
+  execution_order:
+    recommended_sequence:
+      - step: 1
+        action: Run universal_pre_test_baseline
+      - step: 2
+        scenario: E
+        rationale: Lowest blast radius — isolated to vm-win
+      - step: 3
+        scenario: A
+        rationale: Auto-terminates — no manual cleanup required
+      - step: 4
+        scenario: B
+        rationale: Auto-terminates — verify DB CPU credits before starting
+      - step: 5
+        scenario: C
+        rationale: Highest operator attention needed — monitor session stability
+      - step: 6
+        scenario: D
+        rationale: Run last — requires two concurrent Bastion sessions
+    between_tests: Wait 2 minutes, re-run universal_pre_test_baseline to confirm full recovery
+
+  emergency_abort:
+    description: >
+      If any test leaves the environment unrecoverable within 5 minutes,
+      restart the affected VM from the operator workstation.
+    command: "az vm restart -g rg-ailab-nikhil -n <vm-name>"
+    notes:
+      - iptables rules are non-persistent — cleared automatically on VM reboot
+      - stress-ng and psql sleep jobs terminate on VM restart
+      - diskfill.img survives reboot — use boot diagnostics serial console to rm if Bastion access is lost

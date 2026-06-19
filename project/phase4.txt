@@ -1,0 +1,51 @@
+You are a senior database infrastructure on-call engineer.
+A production incident has occurred in the FinBridge Azure environment.
+
+Analyse ALL the evidence below and answer:
+1. FIRST EVENT: What was the first evidence of the incident by timestamp?
+2. ROOT CAUSE: State the root cause in one sentence.
+3. EVIDENCE CHAIN: List the evidence items that confirm your root cause.
+   For each: evidence item → what it shows → why it supports root cause.
+4. BLAST RADIUS: Which services are currently affected?
+5. IMMEDIATE ACTION: Fastest action to restore service?
+6. 5-WHY: Produce a 5-Why analysis anchored to specific evidence items.
+7. TIMELINE: From first event to current state.
+
+Constraints:
+  - Only use evidence provided — no assumptions
+  - Every statement must reference a specific evidence item
+  - Flag any evidence that contradicts your hypothesis
+
+--- EVIDENCE ---
+[paste the full bundle-evidence.sh output here]
+[paste ~/incident-activity-log.txt contents]
+[paste ~/incident-nsg-rules.txt contents]
+
+Give our existing runbook as context in the same prompt
+---
+Our approved DB connectivity runbook:
+ Step 1: Confirm failure — nc -zv -w5 10.0.2.10 5432',
+ Step 2: Check NSG deny rules — az network nsg rule list',
+ Step 3: Check Activity Log for recent NSG changes',
+ Step 4a: If deny rule found — delete it (requires approval)',
+ Step 4b: If no deny rule — check NIC assignment',
+ Step 5: Validate recovery — nc -zv then psql',
+ Step 6: Confirm PostgreSQL pool has recovered (<10/20 connections)'
+
+ Which step are we at given this evidence and RCA for the issue?
+
+Given your constraints (“only use evidence provided” and “every statement must reference evidence”), I cannot responsibly provide:
+
+First event timestamp
+Confirmed one-line root cause
+Evidence chain
+Current blast radius
+Exact immediate action step
+5-Why anchored to evidence
+Verified timeline and runbook step
+Provisional runbook status:
+
+Based only on your prior confirmed statement in this chat (“NSG rule change blocked DB connectivity at 09:14:03”), this usually places us at Step 4a (remove deny rule with approval), then Step 5/6 validation.
+This remains provisional until the three evidence artifacts are pasted.
+Paste those three evidence blocks, and I will return a complete, audit-ready RCA with explicit evidence mapping in one response.
+

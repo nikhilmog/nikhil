@@ -1,0 +1,17 @@
+vm-db runs PostgreSQL 17 with max_connections=20 on Standard_B2ms (2vCPU, 8GB RAM).
+Connection peaks reach 50/70 during lab exercises.
+
+Using the PostgreSQL formula:
+  shared_buffers    = 25% of RAM
+  effective_cache_size = 75% of RAM
+  work_mem = (RAM - shared_buffers) / max_connections / 2
+
+Answer these questions:
+1. Calculate the recommended values for shared_buffers, effective_cache_size,
+   and work_mem for an 12GB RAM server with max_connections=20.
+2. PgBouncer connection pooling allows max_connections=200 at the app level while
+   the DB maintains only 20. What are the implications of adding PgBouncer?
+3. If we increase max_connections to 100 without PgBouncer, what happens to
+   work_mem per connection? Is this safe on 8GB RAM?
+4. Write the exact ALTER SYSTEM commands to apply the optimised settings.
+
